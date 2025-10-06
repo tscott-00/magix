@@ -1,0 +1,279 @@
+# Core functionality
+# Authors: Thomas A. Scott https://www.scott-aero.com/
+
+from functools import partial, reduce
+from dataclasses import dataclass, field, is_dataclass, make_dataclass
+from dataclasses import fields as get_fields
+
+import scipy
+import numpy as np
+import jax
+import jax.numpy as jnp
+import jax.typing as jtp
+
+# Magix classes should be initialized by user with Class.new(), which is auto-generated if not user-specified
+# This is because JAX jit compiled dataclasses are internally copied by calling the constructor with all fields, preventing custom initializers
+# Only variables explicitly specified in jit_statics are guaranteed to trigger recompilation
+def magix_class(cls=None, *, jit_statics=[]):
+    def _magix_class(cls):
+        if not hasattr(cls, 'new'):
+            setattr(cls, 'new', classmethod(lambda cls, *vargs, **kwargs: cls(*vargs, **kwargs)))
+        jit_variables = []
+        cls = dataclass(cls) # Turn into dataclass
+        fields = get_fields(cls) # Get fields (everything that was annotated)
+        # TODO: Error if not annotated
+        for field in fields:
+            if not field.name in jit_statics:
+                jit_variables.append(field.name)
+        # print(cls, jit_variables, jit_statics)
+        jax.tree_util.register_dataclass(cls, data_fields=jit_variables, meta_fields=jit_statics)
+        return cls
+    
+    # Handle args vs no args provided flexibility
+    if cls is None:
+        return _dsp_class
+    return _dsp_class(cls)
+
+# Class that indicates an incorrect configuration if not changed
+class Placeholder:
+    def __init__(self, error_message='Placeholder not set, make sure a dsp_class is constructed via MyClass.new() instead of MyClass()'):
+        self.error_message = error_message
+
+# Indicates a field will be part of the dynamic shape, user provides shape of data (at a given time for a single MC sample)
+class Dynamic():
+    def __init__(self, shape = ()):
+        self.shape = shape
+        if type(shape) is int:
+            self.N = shape
+        else: # Assume iterable, for will throw type error if shape is invalid type
+            self.N = 1
+            if len(shape) > 0: # Empty tuple is single value
+                for N_i in shape:
+                    if not type(N_i) is int:
+                        raise TypeError('An iterable shape must only contain int values')
+                    self.N *= N_i
+                if self.N < 1:
+                    raise ValueError('Must indicate at least 1 value stored')
+
+# Indicates a derivative of 
+class Derivative():
+    def __init__(self, field_name: str):
+        self.field_name = field_name
+
+# Dynamic and Derivative fields in a dsp_class are automatically turned into a DynamicsMap during build_z and store indices to the dynamic map
+@partial(jax.tree_util.register_dataclass, data_fields=['I'], meta_fields=[])
+class DynamicsMap:
+    I: jtp.ArrayLike # Indices into aggregate dynamic state
+    def __init__(self, I):
+        self.I = I
+
+class MagixWrapper:
+    class Iterable:
+        class Iterator:
+            def __init__(self, z_node_wrapper, z_node_iter):
+                self.z_node_wrapper = z_node_wrapper
+                self.z_node_iter = z_node_iter
+            
+            def __next__(self):
+                value = self.z_node_iter.__next__()
+                return self.z_node_wrapper.wrap(value)
+        
+        def __init__(self, z_box, z_node, i_pre=None):
+            self.__dict__['z_box'] = z_box
+            self.__dict__['z_node'] = z_node
+            self.__dict__['i_pre'] = i_pre
+        
+        def wrap(self, value):
+            # TODO: if support dynamic in init, support DynamicsMap here...
+            if is_dataclass(type(value)):
+                return MagixWrapper(self.z_box, value, is_root=False, i_pre=self.i_pre)
+            elif callable(value):
+                raise ValueError('Collections of functions not supported, may later support static functions')
+            elif type(value) in [list, tuple, dict]:
+                return Iterable(self.z_box, value, self.i_pre)
+            else:
+                return value
+        
+        def __getitem__(self, item):
+            value = self.z_node[item]
+            return self.wrap(value)
+        
+        def __iter__(self):
+            # print(type(self.z_node))
+            # If dict then return standard key iterator
+            if type(self.z_node) == dict:
+                return self.z_node.__iter__()
+            return self.Iterator(self, self.z_node.__iter__())
+    
+    # Shared container to keep track of mutating z_dyn, subclass so it can be used in other wrappers easily
+    class ZBox:
+        def __init__(self, z_dyn):
+            self.z_dyn = z_dyn
+
+        def getz(self, I, i_pre: tuple = None):
+            if i_pre == None:
+                return self.z_dyn[..., I]
+            else:
+                return self.z_dyn[*i_pre, ..., I]
+        
+        def setz(self, I, value, i_pre: tuple = None):
+            if i_pre == None:
+                self.z_dyn = self.z_dyn.at[..., I].set(value)
+            else:
+                self.z_dyn = self.z_dyn.at[*i_pre, ..., I].set(value)
+    
+    def __init__(self, z_dyn, z_node, is_root, i_pre=None):
+        # Use __dict__ when initializing to avoid __setattr__
+        if is_root:
+            self.__dict__['z_box'] = self.ZBox(z_dyn)
+        else:
+            self.__dict__['z_box'] = z_dyn
+        self.__dict__['z_node'] = z_node
+        # if i_t == None:
+            # i_t = slice(self.__dict__['z_box'].z_dyn.shape[0])
+        if i_pre != None and type(i_pre) != tuple:
+            i_pre = (i_pre,)
+        self.__dict__['i_pre'] = i_pre
+    
+    def __getattr__(self, name):
+        # value = self.z_node.__dict__[name]
+        value = getattr(self.z_node, name) # Get value or function from actual z object
+        if type(value) is DynamicsMap:
+            return self.z_box.getz(value.I, i_pre=self.i_pre) # self.z_box.z_dyn[self.i_t,...,value.I]
+        elif is_dataclass(type(value)):
+            return MagixWrapper(self.z_box, value, is_root=False, i_pre=self.i_pre)
+        elif callable(value):
+            return partial(value, magix_self=self)
+        elif type(value) in [list, tuple, dict]:
+            return self.Iterable(self.z_box, value, self.i_pre)
+        else:
+            return value
+    
+    def __call__(self, *v, **k):
+        return self.z_node(*v, magix_self=self, **k)
+    
+    def __setattr__(self, name, value):
+        z_leaf = self.z_node.__dict__[name]
+        if type(z_leaf) is DynamicsMap:
+            # self.z_box.z_dyn = self.z_box.z_dyn.at[self.i_t,...,z_leaf.I].set(value)
+            self.z_box.setz(z_leaf.I, value, i_pre=self.i_pre)
+        else:
+            raise ValueError('{} isn\'t mutable; all mutable states must be stored as a DynamicsMap'.format(name))
+
+    def __getitem__(self, i_pre):
+        return MagixWrapper(self.z_box, self.z_node, is_root=False, i_pre=i_pre)
+    
+    # TODO: repr for tree structure only, dynamic only, and static only, no children ie ...
+    def __repr__(self):
+        fields = get_fields(type(self.z_node))
+        fields_repr = ''
+        for field in fields:
+            value = getattr(self.z_node, field.name)
+            if type(value) is DynamicsMap:
+                fields_repr += '{}: {}, '.format(field.name, np.array2string(self.z_box.getz(value.I, i_pre=self.i_pre), max_line_width=1000))
+            elif is_dataclass(type(value)):
+                fields_repr += '{}( {} ), '.format(field.name, MagixWrapper(self.z_box, value, is_root=False, i_pre=self.i_pre))
+            else:
+                fields_repr += '{}: {}, '.format(field.name, value)
+        return fields_repr
+
+# Magical function decorator
+# Static functions can be called from anywhere and take and return only z
+# Member functions are only called from rizzy static functions and can take and return anything
+def magix(func):
+    # @functools.wraps(func) # TODO: retain signature
+    # Users should call with z, internal state managers like integrators should call with z_dyn and z
+    def with_magix(*vargs, **kwargs):
+        # TODO: actually detect self via inspect
+        if len(vargs) > 0:
+            if not 'magix_self' in kwargs:
+                # TODO: could maybe allow if it returns z and can figure out where it is inside z...
+                raise ValueError('Rizzy member functions must be called from within a rizzy static function as part of wrapped z')
+            # TODO: allow any return?
+            # if 'z' in kwargs:
+                # return func(kwargs['magix_self'], *vargs[1:], z=kwargs['z'])
+            # else:
+                # return func(kwargs['magix_self'], *vargs[1:])
+            filtered_kwargs = {k: v for k,v in kwargs.items() if k != 'magix_self'}
+            # print([type(v) for v in vargs])
+            return func(kwargs['magix_self'], *vargs[1:], **filtered_kwargs)
+        else:
+            z = kwargs['z']
+            if 'z_dyn' in kwargs:
+                return func(z=MagixWrapper(kwargs['z_dyn'], z, is_root=True)).z_box.z_dyn
+            elif z is MagixWrapper:
+                # If given a RizzContainr, know this is rizzception and don't intervene
+                # TODO: allow generic return if nested static? take root flag for clarity?
+                return func(z=z)
+            else:
+                raise ValueError('Outermost rizzy function must be called with z and z_dyn as kwargs, inner functions must be called with wrapped z')
+    
+    return with_rizz
+
+def bake_list(z_list, z_ptr, dmap_z_I, dmap_dz_I):
+    for z_item in z_list:
+        if is_dataclass(type(z_item)):
+            z_ptr, dmap_z_I, dmap_dz_I = bake_branch(z_item, z_ptr, dmap_z_I, dmap_dz_I)
+        elif type(z_item) is Derivative:
+            raise TypeError('not supported')
+        elif is_dataclass(type(z_item)):
+            raise TypeError('not supported')
+        elif type(z_item) is Placeholder:
+            raise ValueError('Field {} of {} was unset, stored error message: {}'.format(field.name, type(z_branch), value.error_message))
+        # Can be static variable, leave it alone
+    
+    return z_ptr, dmap_z_I, dmap_dz_I
+
+def bake_branch(z_branch, z_ptr, dmap_z_I, dmap_dz_I):
+    if is_dataclass(type(z_branch)):
+        fields = get_fields(z_branch)
+    elif type(z_branch) is list or type(z_branch) is tuple:
+        return bake_list(z_branch, z_ptr, dmap_z_I, dmap_dz_I)
+    elif type(z_branch) is dict:
+        return bake_list(z_branch.values(), z_ptr, dmap_z_I, dmap_dz_I)
+    else:
+        raise TypeError('Unrecognized z branch type {}'.format(type(z_branch)))
+    
+    dmap = { }
+    for field in fields:
+        z_item = getattr(z_branch, field.name)
+        # print(field.name, value)
+        if type(z_item) is Dynamic:
+            # print('Setting dynamic', field.name)
+            setattr(z_branch, field.name, DynamicsMap(z_ptr + jnp.arange(z_item.N).reshape(z_item.shape)))
+            z_ptr += z_item.N
+        elif type(z_item) is Derivative:
+            dmap[z_item.field_name] = field.name # map is from a fields's name to it's derivative's name
+        elif is_dataclass(type(z_item)) or type(z_item) in [list, tuple, dict]:
+            # print('Processing child branch', field.name)
+            z_ptr, dmap_z_I, dmap_dz_I = bake_branch(z_item, z_ptr, dmap_z_I, dmap_dz_I)
+        elif type(z_item) is Placeholder:
+            raise ValueError('Field {} of {} was unset, stored error message: {}'.format(field.name, type(z_branch), z_item.error_message))
+    
+    # Set derivative's dynamic maps last, assumes higher order derivatives were declared in accending order
+    for value_name, deriv_name in dmap.items():
+        value_zmap = getattr(z_branch, value_name)
+        if not type(value_zmap) is DynamicsMap:
+            raise ValueError('Derivative variable {} in {} points to a {}, which should have started as a Dynamic or Derivative field and now be a DynamicsMap; if it is a derivative of a derivative, it should be declared after'.format(deriv_name, value_name, type(value_zmap)))
+        setattr(z_branch, deriv_name, DynamicsMap(z_ptr + jnp.arange(value_zmap.I.size).reshape(value_zmap.I.shape)))
+        z_ptr += value_zmap.I.size
+    
+    dmap_z_I  += [getattr(z_branch,value_name).I.ravel() for value_name in dmap.keys()]
+    dmap_dz_I += [getattr(z_branch,deriv_name).I.ravel() for deriv_name in dmap.values()]
+    
+    return z_ptr, dmap_z_I, dmap_dz_I
+
+# Preprocess component classes into an aggregate z usable in rizzy functions, create shared dynamic array while filling z with its index maps, and resolve derivative relationships
+def bake(**z_branches):
+    z = dsp_class(make_dataclass('_GeneratedZ', [subclass_name for subclass_name in z_branches]))(**z_branches)
+    z_ptr, dmap_z_I, dmap_dz_I = bake_branch(z, z_ptr=0, dmap_z_I=[], dmap_dz_I=[])
+    
+    # Create arrays to be used in time stepping like z_dyn[...,dmap_z_I] += dt*z_dyn[...,dmap_dz_I])
+    if len(dmap_z_I) > 0:
+        dmap_z_I  = jnp.concatenate(dmap_z_I)
+        dmap_dz_I = jnp.concatenate(dmap_dz_I)
+    else:
+        dmap_z_I  = jnp.zeros(0)
+        dmap_dz_I = jnp.zeros(0)
+
+    return z, z_ptr, dmap_z_I, dmap_dz_I # Note N_dyn = z_ptr
