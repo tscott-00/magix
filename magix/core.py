@@ -14,8 +14,8 @@ import jax.typing as jtp
 # Magix classes should be initialized by user with Class.new(), which is auto-generated if not user-specified
 # This is because JAX jit compiled dataclasses are internally copied by calling the constructor with all fields, preventing custom initializers
 # Only variables explicitly specified in jit_statics are guaranteed to trigger recompilation
-def magix_class(cls=None, *, jit_statics=[]):
-    def _magix_class(cls):
+def magiclass(cls=None, *, jit_statics=[]):
+    def _magiclass(cls):
         if not hasattr(cls, 'new'):
             setattr(cls, 'new', classmethod(lambda cls, *vargs, **kwargs: cls(*vargs, **kwargs)))
         jit_variables = []
@@ -31,8 +31,8 @@ def magix_class(cls=None, *, jit_statics=[]):
     
     # Handle args vs no args provided flexibility
     if cls is None:
-        return _dsp_class
-    return _dsp_class(cls)
+        return _magiclass
+    return _magiclass(cls)
 
 # Class that indicates an incorrect configuration if not changed
 class Placeholder:
@@ -114,13 +114,13 @@ class MagixWrapper:
             if i_pre == None:
                 return self.z_dyn[..., I]
             else:
-                return self.z_dyn[*i_pre, ..., I]
+                return self.z_dyn[i_pre+(..., I)]
         
         def setz(self, I, value, i_pre: tuple = None):
             if i_pre == None:
                 self.z_dyn = self.z_dyn.at[..., I].set(value)
             else:
-                self.z_dyn = self.z_dyn.at[*i_pre, ..., I].set(value)
+                self.z_dyn = self.z_dyn.at[i_pre+(..., I)].set(value)
     
     def __init__(self, z_dyn, z_node, is_root, i_pre=None):
         # Use __dict__ when initializing to avoid __setattr__
@@ -179,16 +179,16 @@ class MagixWrapper:
 
 # Magical function decorator
 # Static functions can be called from anywhere and take and return only z
-# Member functions are only called from rizzy static functions and can take and return anything
-def magix(func):
+# Member functions are only called from magix static functions and can take and return anything
+def jit(func):
     # @functools.wraps(func) # TODO: retain signature
     # Users should call with z, internal state managers like integrators should call with z_dyn and z
-    def with_magix(*vargs, **kwargs):
+    def with_jit(*vargs, **kwargs):
         # TODO: actually detect self via inspect
         if len(vargs) > 0:
             if not 'magix_self' in kwargs:
                 # TODO: could maybe allow if it returns z and can figure out where it is inside z...
-                raise ValueError('Rizzy member functions must be called from within a rizzy static function as part of wrapped z')
+                raise ValueError('Magix member functions must be called from within a magix static function as part of wrapped z')
             # TODO: allow any return?
             # if 'z' in kwargs:
                 # return func(kwargs['magix_self'], *vargs[1:], z=kwargs['z'])
@@ -202,13 +202,13 @@ def magix(func):
             if 'z_dyn' in kwargs:
                 return func(z=MagixWrapper(kwargs['z_dyn'], z, is_root=True)).z_box.z_dyn
             elif z is MagixWrapper:
-                # If given a RizzContainr, know this is rizzception and don't intervene
+                # If given a MagixWrapper, know this is magiception and don't intervene
                 # TODO: allow generic return if nested static? take root flag for clarity?
                 return func(z=z)
             else:
-                raise ValueError('Outermost rizzy function must be called with z and z_dyn as kwargs, inner functions must be called with wrapped z')
+                raise ValueError('Outermost magix function must be called with z and z_dyn as kwargs, inner functions must be called with wrapped z')
     
-    return with_rizz
+    return with_jit
 
 def bake_list(z_list, z_ptr, dmap_z_I, dmap_dz_I):
     for z_item in z_list:
@@ -263,9 +263,9 @@ def bake_branch(z_branch, z_ptr, dmap_z_I, dmap_dz_I):
     
     return z_ptr, dmap_z_I, dmap_dz_I
 
-# Preprocess component classes into an aggregate z usable in rizzy functions, create shared dynamic array while filling z with its index maps, and resolve derivative relationships
+# Preprocess component classes into an aggregate z usable in magix functions, create shared dynamic array while filling z with its index maps, and resolve derivative relationships
 def bake(**z_branches):
-    z = dsp_class(make_dataclass('_GeneratedZ', [subclass_name for subclass_name in z_branches]))(**z_branches)
+    z = magiclass(make_dataclass('_GeneratedZ', [subclass_name for subclass_name in z_branches]))(**z_branches)
     z_ptr, dmap_z_I, dmap_dz_I = bake_branch(z, z_ptr=0, dmap_z_I=[], dmap_dz_I=[])
     
     # Create arrays to be used in time stepping like z_dyn[...,dmap_z_I] += dt*z_dyn[...,dmap_dz_I])

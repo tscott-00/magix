@@ -1,1 +1,1 @@
-from core import Placeholder, Dynamic, Derivative, bake
+from .core import jit, magiclass, Placeholder, Dynamic, Derivative, bake
