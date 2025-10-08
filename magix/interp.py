@@ -36,7 +36,7 @@ class LerpBases:
         # bases = jax.scipy.interpolate.RegularGridInterpolator(x, y, method='linear')
         return cls(x, f, left, right, jnp.ones(f.size//x.size))
     
-    @magix.jit
+    @magixmethod
     def __call__(self, xs):
         # Slop-free version of jnp.interp (edge cases are disallowed in constructor instead of handled in runtime)
         i = jnp.clip(jnp.searchsorted(self.x, xs, side='right'), 1, len(self.x) - 1)
@@ -80,7 +80,7 @@ class BilerpBases:
         return cls(x, y, f, inv_labels)
     
     # TODO: allow stuff like bases(0.5)['mach'] and bases(0.5).mach?
-    @magix.jit
+    @magixmethod
     def __call__(self, xs, ys):
         # Direct extension of 1D version
         i, j = [jnp.clip(jnp.searchsorted(_x, _xs, side='right'), 1, len(_x)-1) for _x, _xs in [(self.x, xs), (self.y, ys)]]
@@ -104,6 +104,6 @@ class DummyBases:
             offsets = jnp.zeros(f.shape)
         return cls(f, offsets)
     
-    @magix.jit
+    @magixmethod
     def __call__(self, xs):
         return self.f

@@ -180,10 +180,10 @@ class MagixWrapper:
 # Magical function decorator
 # Static functions can be called from anywhere and take and return only z
 # Member functions are only called from magix static functions and can take and return anything
-def jit(func):
+def magixmethod(func):
     # @functools.wraps(func) # TODO: retain signature
     # Users should call with z, internal state managers like integrators should call with z_dyn and z
-    def with_jit(*vargs, **kwargs):
+    def with_magix(*vargs, **kwargs):
         # TODO: actually detect self via inspect
         if len(vargs) > 0:
             if not 'magix_self' in kwargs:
@@ -198,17 +198,16 @@ def jit(func):
             # print([type(v) for v in vargs])
             return func(kwargs['magix_self'], *vargs[1:], **filtered_kwargs)
         else:
-            z = kwargs['z']
-            if 'z_dyn' in kwargs:
-                return func(z=MagixWrapper(kwargs['z_dyn'], z, is_root=True)).z_box.z_dyn
-            elif z is MagixWrapper:
+            if 'z_tree' in kwargs:
+                return func(z=MagixWrapper(kwargs['z_dyn'], kwargs['z_tree'], is_root=True)).z_box.z_dyn
+            elif 'z' in kwargs:
                 # If given a MagixWrapper, know this is magiception and don't intervene
                 # TODO: allow generic return if nested static? take root flag for clarity?
-                return func(z=z)
+                return func(z=kwargs['z'])
             else:
-                raise ValueError('Outermost magix function must be called with z and z_dyn as kwargs, inner functions must be called with wrapped z')
+                raise ValueError('Magix methods must be called with either wrapped z kwarg or both z_tree and z_dyn kwargs')
     
-    return with_jit
+    return with_magix
 
 def bake_list(z_list, z_ptr, dmap_z_I, dmap_dz_I):
     for z_item in z_list:
@@ -263,10 +262,12 @@ def bake_branch(z_branch, z_ptr, dmap_z_I, dmap_dz_I):
     
     return z_ptr, dmap_z_I, dmap_dz_I
 
-# Preprocess component classes into an aggregate z usable in magix functions, create shared dynamic array while filling z with its index maps, and resolve derivative relationships
-def bake(**z_branches):
-    z = magiclass(make_dataclass('_GeneratedZ', [subclass_name for subclass_name in z_branches]))(**z_branches)
-    z_ptr, dmap_z_I, dmap_dz_I = bake_branch(z, z_ptr=0, dmap_z_I=[], dmap_dz_I=[])
+# TODO: should we really be modifying z_tree?
+def bake_tree(z_tree):
+    """
+    This WILL MODIFY z_tree
+    """
+    z_ptr, dmap_z_I, dmap_dz_I = bake_branch(z_tree, z_ptr=0, dmap_z_I=[], dmap_dz_I=[])
     
     # Create arrays to be used in time stepping like z_dyn[...,dmap_z_I] += dt*z_dyn[...,dmap_dz_I])
     if len(dmap_z_I) > 0:
@@ -276,4 +277,13 @@ def bake(**z_branches):
         dmap_z_I  = jnp.zeros(0)
         dmap_dz_I = jnp.zeros(0)
 
-    return z, z_ptr, dmap_z_I, dmap_dz_I # Note N_dyn = z_ptr
+    return { 'z_tree': z_tree, 'N_dyn': z_ptr, 'dmap_z_I': dmap_z_I, 'dmap_dz_I': dmap_dz_I }
+
+# Preprocess component classes into an aggregate z usable in magix functions, create shared dynamic array while filling z with its index maps, and resolve derivative relationships
+def bake_trees(**z_branches):
+    return bake_tree(magiclass(make_dataclass('_GeneratedZ', [subclass_name for subclass_name in z_branches]))(**z_branches))
+
+def zeros(z_meta, shape=()):
+    if type(shape) is int:
+        shape = (shape,)
+    return MagixWrapper(jnp.zeros(shape+(z_meta['N_dyn'],)), z_meta['z_tree'], is_root=True)
