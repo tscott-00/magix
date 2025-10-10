@@ -105,6 +105,51 @@ class MagixWrapper:
                 return self.z_node.__iter__()
             return self.Iterator(self, self.z_node.__iter__())
     
+    class LerpWrapper:
+        def __init__(self, z_dyn, z_node, i1_pre, l_pre):
+            self.__dict__['z_box'] = z_dyn
+            self.__dict__['z_node'] = z_node
+            self.__dict__['i1_pre'] = i1_pre
+            self.__dict__['l_pre'] = l_pre
+
+        def __setattr__(self, name, value):
+            raise Error('Interpolation is for get access only')
+
+        def __getattr__(self, name):
+            value = getattr(self.z_node, name) # Get value or function from actual z object
+            if type(value) is DynamicsMap:
+                return self.z_box.getz(value.I, i_pre=(self.i1_pre-1,))*(1-self.l_pre) + self.z_box.getz(value.I, i_pre=(self.i1_pre,))*self.l_pre
+            elif is_dataclass(type(value)):
+                return LerpWrapper(self.z_box, value, self.i1_pre, self.l_pre)
+            elif type(value) in [list, tuple, dict]:
+                raise ValueError('Upcoming feature') # TODO: need another? or just test in wrap?
+            else:
+                raise ValueError('Can only interpolate dynamics')
+
+    # class Array:
+    #     # i_pre = 
+    #     # z_box = 
+
+    #     def __init__(self, z_box, i_pre = None):
+    #         self.z_box = z_box
+    #         self.i_pre = i_pre
+
+    #     def __getitem__(self, idx):
+    #         return self.z_box.getz(idx, self.i_pre)
+
+    #     def __setitem__(self, idx, value):
+    #         self.z_box.setz(idx, value, self.i_pre)
+
+    #     def __neg__(self): return self[...]._neg(self)
+    #     def __add__(self, other): return self.aval._add(self, other)
+    #     def __radd__(self, other): return self.aval._radd(self, other)
+    #     def __mul__(self, other): return self.aval._mul(self, other)
+    #     def __rmul__(self, other): return self.aval._rmul(self, other)
+    #     def __gt__(self, other): return self.aval._gt(self, other)
+    #     def __lt__(self, other): return self.aval._lt(self, other)
+    #     def __bool__(self): return self.aval._bool(self)
+    #     def __nonzero__(self): return self.aval._nonzero(self)
+
     # Shared container to keep track of mutating z_dyn, subclass so it can be used in other wrappers easily
     class ZBox:
         def __init__(self, z_dyn):
@@ -114,7 +159,8 @@ class MagixWrapper:
             if i_pre == None:
                 return self.z_dyn[..., I]
             else:
-                return self.z_dyn[i_pre+(..., I)]
+                return self.z_dyn[i_pre+(..., I)].T # TODO: better way of dealing with weird transposing np does?
+                # return self.z_dyn[i_pre+(:,I,)]
         
         def setz(self, I, value, i_pre: tuple = None):
             if i_pre == None:
@@ -135,10 +181,14 @@ class MagixWrapper:
             i_pre = (i_pre,)
         self.__dict__['i_pre'] = i_pre
     
+    def __call__(self, *v, **k):
+        return self.z_node(*v, magix_self=self, **k)
+
     def __getattr__(self, name):
         # value = self.z_node.__dict__[name]
         value = getattr(self.z_node, name) # Get value or function from actual z object
         if type(value) is DynamicsMap:
+            # TODO: to support in place slice assignments, have to wrap in something new
             return self.z_box.getz(value.I, i_pre=self.i_pre) # self.z_box.z_dyn[self.i_t,...,value.I]
         elif is_dataclass(type(value)):
             return MagixWrapper(self.z_box, value, is_root=False, i_pre=self.i_pre)
@@ -148,9 +198,6 @@ class MagixWrapper:
             return self.Iterable(self.z_box, value, self.i_pre)
         else:
             return value
-    
-    def __call__(self, *v, **k):
-        return self.z_node(*v, magix_self=self, **k)
     
     def __setattr__(self, name, value):
         z_leaf = self.z_node.__dict__[name]
@@ -162,7 +209,12 @@ class MagixWrapper:
 
     def __getitem__(self, i_pre):
         return MagixWrapper(self.z_box, self.z_node, is_root=False, i_pre=i_pre)
-    
+
+    def lerp(self, ts: float, t: jtp.ArrayLike):
+        i1 = jnp.clip(jnp.searchsorted(t, ts, side='right'), 1, len(t) - 1)
+        l  = jnp.clip((ts - t[i1-1])/(t[i1] - t[i1-1]), 0.0, 1.0)
+        return self.LerpWrapper(self.z_box, self.z_node, i1, l)
+
     # TODO: repr for tree structure only, dynamic only, and static only, no children ie ...
     def __repr__(self):
         fields = get_fields(type(self.z_node))
