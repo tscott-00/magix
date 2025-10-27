@@ -41,8 +41,11 @@ class Placeholder:
 
 # Indicates a field will be part of the dynamic shape, user provides shape of data (at a given time for a single MC sample)
 class Dynamic():
-    def __init__(self, shape = ()):
+    def __init__(self, shape = (), labels=None):
+        if labels == None: labels = []
+        
         self.shape = shape
+        self.labels = labels
         if type(shape) is int:
             self.N = shape
         else: # Assume iterable, for will throw type error if shape is invalid type
@@ -55,10 +58,13 @@ class Dynamic():
                 if self.N < 1:
                     raise ValueError('Must indicate at least 1 value stored')
 
-# Indicates a derivative of 
+# Indicates a derivative of a Dynamic variable
 class Derivative():
-    def __init__(self, field_name: str):
+    def __init__(self, field_name: str, labels=None):
+        if labels == None: labels = []
+        
         self.field_name = field_name
+        self.labels = labels
 
 # Dynamic and Derivative fields in a dsp_class are automatically turned into a DynamicsMap during build_z and store indices to the dynamic map
 @partial(jax.tree_util.register_dataclass, data_fields=['I'], meta_fields=[])
@@ -261,10 +267,10 @@ def magixmethod(func):
     
     return with_magix
 
-def bake_list(z_list, z_ptr, dmap_z_I, dmap_dz_I):
+def bake_list(z_list, z_ptr, dmap_z_I, dmap_dz_I, labels_I):
     for z_item in z_list:
         if is_dataclass(type(z_item)):
-            z_ptr, dmap_z_I, dmap_dz_I = bake_branch(z_item, z_ptr, dmap_z_I, dmap_dz_I)
+            z_ptr, dmap_z_I, dmap_dz_I = bake_branch(z_item, z_ptr, dmap_z_I, dmap_dz_I, labels_I)
         elif type(z_item) is Derivative:
             raise TypeError('not supported')
         elif is_dataclass(type(z_item)):
@@ -273,15 +279,22 @@ def bake_list(z_list, z_ptr, dmap_z_I, dmap_dz_I):
             raise ValueError('Field {} of {} was unset, stored error message: {}'.format(field.name, type(z_branch), value.error_message))
         # Can be static variable, leave it alone
     
-    return z_ptr, dmap_z_I, dmap_dz_I
+    return z_ptr, dmap_z_I, dmap_dz_I, labels_I
 
-def bake_branch(z_branch, z_ptr, dmap_z_I, dmap_dz_I):
+def add_label_I(label, I, labels_I):
+    if label not in labels_I:
+        labels_I[label] = []
+    labels_I[label].append(I)
+    
+    return labels_I
+
+def bake_branch(z_branch, z_ptr, dmap_z_I, dmap_dz_I, labels_I):
     if is_dataclass(type(z_branch)):
         fields = get_fields(z_branch)
     elif type(z_branch) is list or type(z_branch) is tuple:
-        return bake_list(z_branch, z_ptr, dmap_z_I, dmap_dz_I)
+        return bake_list(z_branch, z_ptr, dmap_z_I, dmap_dz_I, labels_I)
     elif type(z_branch) is dict:
-        return bake_list(z_branch.values(), z_ptr, dmap_z_I, dmap_dz_I)
+        return bake_list(z_branch.values(), z_ptr, dmap_z_I, dmap_dz_I, labels_I)
     else:
         raise TypeError('Unrecognized z branch type {}'.format(type(z_branch)))
     
@@ -291,13 +304,16 @@ def bake_branch(z_branch, z_ptr, dmap_z_I, dmap_dz_I):
         # print(field.name, value)
         if type(z_item) is Dynamic:
             # print('Setting dynamic', field.name)
-            setattr(z_branch, field.name, DynamicsMap(z_ptr + jnp.arange(z_item.N).reshape(z_item.shape)))
+            I = z_ptr + jnp.arange(z_item.N).reshape(z_item.shape)
+            for label in z_item.labels: # Record indices to dynamic variable with its labels
+                add_label_I(label, I, labels_I)
+            setattr(z_branch, field.name, DynamicsMap(I))
             z_ptr += z_item.N
         elif type(z_item) is Derivative:
             dmap[z_item.field_name] = field.name # map is from a fields's name to it's derivative's name
         elif is_dataclass(type(z_item)) or type(z_item) in [list, tuple, dict]:
             # print('Processing child branch', field.name)
-            z_ptr, dmap_z_I, dmap_dz_I = bake_branch(z_item, z_ptr, dmap_z_I, dmap_dz_I)
+            z_ptr, dmap_z_I, dmap_dz_I, labels_I = bake_branch(z_item, z_ptr, dmap_z_I, dmap_dz_I, labels_I)
         elif type(z_item) is Placeholder:
             raise ValueError('Field {} of {} was unset, stored error message: {}'.format(field.name, type(z_branch), z_item.error_message))
     
@@ -306,20 +322,25 @@ def bake_branch(z_branch, z_ptr, dmap_z_I, dmap_dz_I):
         value_zmap = getattr(z_branch, value_name)
         if not type(value_zmap) is DynamicsMap:
             raise ValueError('Derivative variable {} in {} points to a {}, which should have started as a Dynamic or Derivative field and now be a DynamicsMap; if it is a derivative of a derivative, it should be declared after'.format(deriv_name, value_name, type(value_zmap)))
-        setattr(z_branch, deriv_name, DynamicsMap(z_ptr + jnp.arange(value_zmap.I.size).reshape(value_zmap.I.shape)))
+        I = z_ptr + jnp.arange(value_zmap.I.size).reshape(value_zmap.I.shape)
+        deriv_item = getattr(z_branch, deriv_name)
+        for label in deriv_item.labels: # Record indices to dynamic variable with its labels
+            add_label_I(label, I, labels_I)
+        setattr(z_branch, deriv_name, DynamicsMap(I))
         z_ptr += value_zmap.I.size
     
     dmap_z_I  += [getattr(z_branch,value_name).I.ravel() for value_name in dmap.keys()]
     dmap_dz_I += [getattr(z_branch,deriv_name).I.ravel() for deriv_name in dmap.values()]
     
-    return z_ptr, dmap_z_I, dmap_dz_I
+    return z_ptr, dmap_z_I, dmap_dz_I, labels_I
 
 # TODO: should we really be modifying z_tree?
 def bake_tree(z_tree):
     """
     This WILL MODIFY z_tree
+    User of lables_I will see a list of jax index arrays, i.e. separate variables, without their names
     """
-    z_ptr, dmap_z_I, dmap_dz_I = bake_branch(z_tree, z_ptr=0, dmap_z_I=[], dmap_dz_I=[])
+    z_ptr, dmap_z_I, dmap_dz_I, labels_I = bake_branch(z_tree, z_ptr=0, dmap_z_I=[], dmap_dz_I=[], labels_I={})
     
     # Create arrays to be used in time stepping like z_dyn[...,dmap_z_I] += dt*z_dyn[...,dmap_dz_I])
     if len(dmap_z_I) > 0:
@@ -328,8 +349,10 @@ def bake_tree(z_tree):
     else:
         dmap_z_I  = jnp.zeros(0)
         dmap_dz_I = jnp.zeros(0)
+    # for label, label_I in labels_I.items():
+        # labels_I[label] = jnp.concatenate(label_I)
 
-    return { 'z_tree': z_tree, 'N_dyn': z_ptr, 'dmap_z_I': dmap_z_I, 'dmap_dz_I': dmap_dz_I }
+    return { 'z_tree': z_tree, 'N_dyn': z_ptr, 'dmap_z_I': dmap_z_I, 'dmap_dz_I': dmap_dz_I, 'labels_I': labels_I }
 
 # Preprocess component classes into an aggregate z usable in magix functions, create shared dynamic array while filling z with its index maps, and resolve derivative relationships
 def bake_trees(**z_branches):
