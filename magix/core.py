@@ -96,7 +96,7 @@ class MagixWrapper:
             elif callable(value):
                 raise ValueError('Collections of functions not supported, may later support static functions')
             elif type(value) in [list, tuple, dict]:
-                return Iterable(self.z_box, value, self.i_pre)
+                return MagixWrapper.Iterable(self.z_box, value, self.i_pre)
             else:
                 return value
         
@@ -119,14 +119,14 @@ class MagixWrapper:
             self.__dict__['l_pre'] = l_pre
 
         def __setattr__(self, name, value):
-            raise Error('Interpolation is for get access only')
+            raise RuntimeError('Interpolation is for get access only')
 
         def __getattr__(self, name):
             value = getattr(self.z_node, name) # Get value or function from actual z object
             if type(value) is DynamicsMap:
                 return self.z_box.getz(value.I, i_pre=(self.i1_pre-1,))*(1-self.l_pre) + self.z_box.getz(value.I, i_pre=(self.i1_pre,))*self.l_pre
             elif is_dataclass(type(value)):
-                return LerpWrapper(self.z_box, value, self.i1_pre, self.l_pre)
+                return MagixWrapper.LerpWrapper(self.z_box, value, self.i1_pre, self.l_pre)
             elif type(value) in [list, tuple, dict]:
                 raise ValueError('Upcoming feature') # TODO: need another? or just test in wrap?
             else:
@@ -219,7 +219,7 @@ class MagixWrapper:
     def lerp(self, ts: float, t: jtp.ArrayLike):
         i1 = jnp.clip(jnp.searchsorted(t, ts, side='right'), 1, len(t) - 1)
         l  = jnp.clip((ts - t[i1-1])/(t[i1] - t[i1-1]), 0.0, 1.0)
-        return self.LerpWrapper(self.z_box, self.z_node, i1, l)
+        return MagixWrapper.LerpWrapper(self.z_box, self.z_node, i1, l)
 
     # TODO: repr for tree structure only, dynamic only, and static only, no children ie ...
     def __repr__(self):
@@ -242,6 +242,17 @@ def magixmethod(func):
     # @functools.wraps(func) # TODO: retain signature
     # Users should call with z, internal state managers like integrators should call with z_dyn and z
     def with_magix(*vargs, **kwargs):
+        options = dict( # Default magix options
+            z_out = True,
+            # TODO: static z option
+            # TODO: specific locked attribs (no read or write)
+            # TODO: way to do separate containers for a set of active variables? could speed up things like pont solver a lot
+        )
+        if 'magix_options' in kwargs:
+            for k, v in kwargs['magix_options'].items():
+                options[k] = v
+            del kwargs['magix_options']
+
         # TODO: actually detect self via inspect
         if len(vargs) > 0:
             if not 'magix_self' in kwargs:
@@ -257,13 +268,17 @@ def magixmethod(func):
             return func(kwargs['magix_self'], *vargs[1:], **filtered_kwargs)
         else:
             if 'z_tree' in kwargs:
-                return func(z=MagixWrapper(kwargs['z_dyn'], kwargs['z_tree'], is_root=True)).z_box.z_dyn
+                result = func(z=MagixWrapper(kwargs['z_dyn'], kwargs['z_tree'], is_root=True))
+                # TODO: allow other return values along with z?
+                if options['z_out']:
+                    result = result.z_box.z_dyn
             elif 'z' in kwargs:
                 # If given a MagixWrapper, know this is magiception and don't intervene
                 # TODO: allow generic return if nested static? take root flag for clarity?
-                return func(z=kwargs['z'])
+                result = func(z=kwargs['z'])
             else:
                 raise ValueError('Magix methods must be called with either wrapped z kwarg or both z_tree and z_dyn kwargs')
+            return result
     
     return with_magix
 
